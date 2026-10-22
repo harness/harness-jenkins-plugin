@@ -101,12 +101,17 @@ public class HarnessRunListener extends RunListener<Run<?, ?>> {
             } else {
                 computer = Jenkins.get().getComputer(nodeName);
             }
-            if (computer == null || computer.getNode() == null) {
+            if (computer == null) {
                 listener.getLogger().println(
                         "[hc] WARNING: Agent '" + nodeName + "' no longer available — skipping logout.");
                 return;
             }
             Node node = computer.getNode();
+            if (node == null) {
+                listener.getLogger().println(
+                        "[hc] WARNING: Agent '" + nodeName + "' no longer available — skipping logout.");
+                return;
+            }
             Launcher launcher = node.createLauncher(listener);
             FilePath workspace = new FilePath(computer.getChannel(), workspacePath);
             boolean isWindows = !launcher.isUnix();

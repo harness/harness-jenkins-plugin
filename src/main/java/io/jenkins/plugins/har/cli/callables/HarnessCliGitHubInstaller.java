@@ -1,51 +1,70 @@
 package io.jenkins.plugins.har.cli.callables;
 
+import hudson.AbortException;
 import hudson.Extension;
 import hudson.FilePath;
+import hudson.Launcher;
 import hudson.ProxyConfiguration;
 import hudson.model.Node;
 import hudson.model.TaskListener;
 import hudson.tools.ToolInstallation;
 import hudson.tools.ToolInstaller;
 import hudson.tools.ToolInstallerDescriptor;
+import hudson.util.ArgumentListBuilder;
+import hudson.util.FormValidation;
 import io.jenkins.plugins.har.Constants;
 import io.jenkins.plugins.har.cli.HarnessCliInstallation;
 import io.jenkins.plugins.har.cli.HarnessOsUtils;
+import jenkins.model.Jenkins;
+import net.sf.json.JSONArray;
+import net.sf.json.JSONException;
+import net.sf.json.JSONObject;
 import org.apache.commons.lang3.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.verb.POST;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.*;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Downloads the Harness CLI (hc) binary from GitHub releases and installs it on Jenkins agents.
+ * Downloads the Harness CLI from harness/cli GitHub releases and installs it on Jenkins agents.
  *
- * <p>Release asset naming convention used by harness/harness-cli (e.g. v1.3.30):
+ * <p>Each release publishes a bundle containing the core {@code harness} binary and the
+ * {@code harness-har} Artifact Registry plugin, plus a SHA-256 checksums file:
  * <pre>
- *   hc_{version}_{os}_{arch}.tar.gz
+ *   harness-bundle_{version}_{os}_{arch}.tar.gz   (linux, darwin)
+ *   harness-bundle_{version}_windows_{arch}.zip
+ *   harness_{version}_checksums.txt
  *
- *   OS   : linux | mac-os | windows
- *   Arch : x86_64 | arm64 | i386
- *
- *   e.g. hc_1.3.30_linux_x86_64.tar.gz
- *        hc_1.3.30_mac-os_arm64.tar.gz
- *        hc_1.3.30_windows_x86_64.tar.gz
+ *   OS   : linux | darwin | windows
+ *   Arch : amd64 | arm64
  * </pre>
  *
+ * <p>After extraction the installer registers {@code harness-har} with
+ * {@code harness install plugin}, using {@code <tool home>/cli-home} as the CLI home so the
+ * installation does not depend on, or modify, the agent user's {@code ~/.harness}.
+ *
  * When version is left blank the installer queries the GitHub Releases API
- * to determine the latest version tag.
+ * to determine the latest version tag, at most once an hour per controller.
  */
 public class HarnessCliGitHubInstaller extends ToolInstaller {
 
     private static final long serialVersionUID = 1L;
-
-
 
     /** Minimum expected binary size – anything smaller is considered a failed download. */
     private static final long MIN_BINARY_SIZE_BYTES = 1024L * 1024L; // 1 MB
@@ -53,8 +72,13 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
     /** Marker file holding the version currently installed in the tool home. */
     private static final String VERSION_MARKER_FILE = ".installed-version";
 
-    /** POSIX mode applied to the downloaded binary: rwxr-xr-x. */
+    /** POSIX mode applied to the downloaded binaries: rwxr-xr-x. */
     private static final int EXECUTABLE_MODE = 0755;
+
+    /** harness/cli also hosts plugin tags (har/v1.3.0) and v0.x tags; only v3+ tags carry the CLI bundle. */
+    private static final Pattern RELEASE_TAG = Pattern.compile("^v(\\d+)\\.\\d+\\.\\d+$");
+    private static final Pattern VERSION = Pattern.compile("^(\\d+)\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$");
+    private static final int MIN_MAJOR_VERSION = 3;
 
     /** Total send() attempts on connect/request timeout only (not HTTP 4xx/5xx). */
     private static final int HTTP_MAX_ATTEMPTS = 8;
@@ -63,6 +87,12 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
     private static HttpClient httpClient = ProxyConfiguration.newHttpClientBuilder()
             .followRedirects(HttpClient.Redirect.ALWAYS)
             .build();
+
+    private static final long LATEST_VERSION_TTL_MS = TimeUnit.HOURS.toMillis(1);
+
+    private record CachedVersion(String version, long fetchedAtMs) {}
+
+    private static final AtomicReference<CachedVersion> latestVersionCache = new AtomicReference<>();
 
     private String version;
 
@@ -93,13 +123,15 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         }
 
         boolean isWindows = !node.createLauncher(log).isUnix();
-        String binaryName = HarnessOsUtils.getBinaryName(isWindows);
-        FilePath cliPath  = toolHome.child(binaryName);
+        FilePath cliPath = toolHome.child(HarnessOsUtils.getBinaryName(isWindows));
+        FilePath cliHome = toolHome.child(HarnessCliInstallation.CLI_HOME_DIR);
+        FilePath registeredHarPlugin = cliHome.child("bin").child(HarnessOsUtils.getHarPluginBinaryName(isWindows));
         FilePath versionMarker = toolHome.child(VERSION_MARKER_FILE);
 
-        // Cheapest check first: is a usable binary already on disk?
+        // Cheapest check first: is a usable installation already on disk?
         String installedVersion = cliPath.exists()
                 && cliPath.length() > MIN_BINARY_SIZE_BYTES
+                && registeredHarPlugin.exists()
                 && versionMarker.exists()
                 ? versionMarker.readToString().trim()
                 : null;
@@ -107,7 +139,7 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         // Only hit the GitHub API when no version is pinned in the configuration.
         String resolvedVersion = StringUtils.isBlank(version)
                 ? resolveLatestVersion(log)
-                : stripLeadingV(version);
+                : normalizeVersion(version);
 
         if (resolvedVersion.equals(installedVersion)) {
             log.getLogger().println("[Harness CLI] Already installed at " + cliPath.getRemote()
@@ -122,22 +154,58 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         String arch = osArch[1];
 
         log.getLogger().println("[Harness CLI] Agent detected: os=" + os + " arch=" + arch);
-
-        String downloadUrl = buildDownloadUrl(resolvedVersion, os, arch);
-        log.getLogger().println("[Harness CLI] Downloading v" + resolvedVersion + ": " + downloadUrl);
-
-        downloadAndExtract(downloadUrl, toolHome, log);
-
-        // Find the hc binary inside the extracted archive tree
-        FilePath binary = findBinaryAfterExtraction(toolHome, binaryName, log);
-        if (!isWindows) {
-            binary.chmod(EXECUTABLE_MODE);
+        if (!HarnessOsUtils.isSupportedArch(arch)) {
+            throw new AbortException("[Harness CLI] Unsupported agent architecture '" + arch
+                    + "'. Harness CLI releases are published for amd64 and arm64.");
         }
+
+        boolean zip = "windows".equals(os);
+        String archiveName = "harness-bundle_" + resolvedVersion + "_" + os + "_" + arch
+                + (zip ? ".zip" : ".tar.gz");
+        String downloadUrl = releaseAssetUrl(resolvedVersion, archiveName);
+
+        // Look the release up before deleting anything: a mistyped version must not wipe a working installation.
+        String expectedSha256 = fetchExpectedSha256(resolvedVersion, archiveName, log);
+
+        // Start from an empty tool home so binaries from a previous version (or the retired hc CLI) do not linger.
+        toolHome.deleteContents();
+
+        log.getLogger().println("[Harness CLI] Downloading v" + resolvedVersion + ": " + downloadUrl);
+        FilePath archive = toolHome.child(archiveName);
+        String actualSha256 = download(downloadUrl, archive, log);
+        if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
+            archive.delete();
+            throw new AbortException("[Harness CLI] SHA-256 mismatch for " + archiveName
+                    + ": expected " + expectedSha256 + ", got " + actualSha256);
+        }
+        log.getLogger().println("[Harness CLI] SHA-256 verified for " + archiveName);
+
+        if (zip) {
+            archive.unzip(toolHome);
+        } else {
+            archive.untar(toolHome, FilePath.TarCompression.GZIP);
+        }
+        archive.delete();
+
+        FilePath extractedHarPlugin = toolHome.child(HarnessOsUtils.getHarPluginBinaryName(isWindows));
+        for (FilePath binary : new FilePath[] {cliPath, extractedHarPlugin}) {
+            if (!binary.exists() || binary.length() <= MIN_BINARY_SIZE_BYTES) {
+                throw new IOException("[Harness CLI] Could not find '" + binary.getName()
+                        + "' after extracting " + archiveName + ". Contents of "
+                        + toolHome.getRemote() + ": " + toolHome.list());
+            }
+            if (!isWindows) {
+                binary.chmod(EXECUTABLE_MODE);
+            }
+        }
+
+        registerHarPlugin(node, cliPath, extractedHarPlugin, cliHome, log);
+        extractedHarPlugin.delete();
 
         // Write the version marker so future runs can skip the download
         versionMarker.write(resolvedVersion, "UTF-8");
 
-        log.getLogger().println("[Harness CLI] Installation complete: " + binary.getRemote()
+        log.getLogger().println("[Harness CLI] Installation complete: " + cliPath.getRemote()
                 + " (v" + resolvedVersion + ")");
 
         return toolHome;
@@ -146,13 +214,26 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
     // -------------------------------------------------------------------------
 
     /**
-     * Calls the GitHub Releases API to get the latest version tag and strips the leading 'v'.
-     * e.g.  "v1.3.30" → "1.3.30"
+     * Returns the newest stable CLI release without the leading 'v' (e.g. "v3.13.0" → "3.13.0"),
+     * reusing the last answer for {@link #LATEST_VERSION_TTL_MS}: Jenkins resolves a tool several
+     * times per build, and unauthenticated GitHub API calls are limited to 60 per hour per IP.
      */
     private static String resolveLatestVersion(TaskListener log)
             throws IOException, InterruptedException {
+        CachedVersion cached = latestVersionCache.get();
+        if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs() < LATEST_VERSION_TTL_MS) {
+            return cached.version();
+        }
+        String ver = fetchLatestVersion(log);
+        latestVersionCache.set(new CachedVersion(ver, System.currentTimeMillis()));
+        return ver;
+    }
+
+    /** Lists releases from the GitHub Releases API and returns the newest stable CLI release. */
+    private static String fetchLatestVersion(TaskListener log)
+            throws IOException, InterruptedException {
         log.getLogger().println("[Harness CLI] Querying GitHub API for latest release...");
-        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(URI.create(Constants.GITHUB_API_LATEST))
+        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(URI.create(Constants.GITHUB_API_RELEASES))
                 .header("Accept", "application/vnd.github.v3+json")
                 .header("User-Agent", "harness-jenkins-plugin")
                 .GET()
@@ -165,45 +246,115 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
             throw new IOException("GitHub API returned HTTP " + status
                     + ". Set a specific version in the tool configuration to avoid this call.");
         }
-        String tagName = extractJsonStringField(response.body(), "tag_name");
-        String ver = stripLeadingV(tagName);
+
+        String ver = latestReleaseVersion(response.body());
         log.getLogger().println("[Harness CLI] Latest version resolved: " + ver);
         return ver;
     }
 
-    /**
-     * Builds the GitHub release download URL.
-     * Pattern: https://github.com/harness/harness-cli/releases/download/v{ver}/hc_{ver}_{os}_{arch}.tar.gz
-     */
-    private static String buildDownloadUrl(String version, String os, String arch) {
-        String tag       = "v" + version;
-        String assetName = "hc_" + version + "_" + os + "_" + arch + ".tar.gz";
-        return Constants.GITHUB_RELEASES_BASE + "/download/" + tag + "/" + assetName;
+    /** GitHub lists releases newest first. */
+    static String latestReleaseVersion(String releasesJson) throws IOException {
+        JSONArray releases;
+        try {
+            releases = JSONArray.fromObject(releasesJson);
+        } catch (JSONException e) {
+            throw new IOException("Failed to parse GitHub releases response: " + e.getMessage(), e);
+        }
+        for (Object entry : releases) {
+            if (!(entry instanceof JSONObject)) {
+                continue;
+            }
+            JSONObject release = (JSONObject) entry;
+            if (release.optBoolean("draft") || release.optBoolean("prerelease")) {
+                continue;
+            }
+            Matcher m = RELEASE_TAG.matcher(release.optString("tag_name"));
+            if (m.matches() && Integer.parseInt(m.group(1)) >= MIN_MAJOR_VERSION) {
+                return stripLeadingV(release.getString("tag_name"));
+            }
+        }
+        throw new IOException("No Harness CLI release found in the GitHub releases response.");
     }
 
-    /**
-     * Downloads the tar.gz from GitHub (following redirects) and extracts it into {@code toolHome}.
-     */
-    private static void downloadAndExtract(String downloadUrl,
-                                           FilePath toolHome, TaskListener log)
+    private static String releaseAssetUrl(String version, String assetName) {
+        return Constants.GITHUB_RELEASES_BASE + "/download/v" + version + "/" + assetName;
+    }
+
+    /** Streams {@code url} into {@code target} and returns the SHA-256 of the downloaded bytes (hex). */
+    private static String download(String url, FilePath target, TaskListener log)
             throws IOException, InterruptedException {
 
-        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(URI.create(downloadUrl))
+        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(URI.create(url))
                 .header("Accept", "application/octet-stream")
                 .GET()
                 .build();
 
         HttpResponse<InputStream> response = sendWithTimeoutRetry(
                 request, HttpResponse.BodyHandlers.ofInputStream(), log);
-        try (InputStream in = response.body()) {
+        MessageDigest sha256 = newSha256();
+        try (InputStream in = new DigestInputStream(response.body(), sha256)) {
             int status = response.statusCode();
             if (status < 200 || status >= 300) {
                 throw new IOException(
-                        "Failed to download Harness CLI — HTTP " + status + " from: " + downloadUrl);
+                        "Failed to download Harness CLI — HTTP " + status + " from: " + url);
             }
-            toolHome.untarFrom(in, FilePath.TarCompression.GZIP);
+            target.copyFrom(in);
         }
-        log.getLogger().println("[Harness CLI] Archive extracted into: " + toolHome.getRemote());
+        return HexFormat.of().formatHex(sha256.digest());
+    }
+
+    private static String fetchExpectedSha256(String version, String archiveName, TaskListener log)
+            throws IOException, InterruptedException {
+        String checksumsUrl = releaseAssetUrl(version, "harness_" + version + "_checksums.txt");
+        HttpRequest request = ProxyConfiguration.newHttpRequestBuilder(URI.create(checksumsUrl))
+                .GET()
+                .build();
+        HttpResponse<String> response = sendWithTimeoutRetry(
+                request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8), log);
+        if (response.statusCode() == 404) {
+            throw new AbortException("[Harness CLI] Version " + version + " was not found. "
+                    + "Pick a version listed at " + Constants.GITHUB_RELEASES_BASE
+                    + ", or leave the version field empty for the latest.");
+        }
+        if (response.statusCode() != 200) {
+            throw new IOException("Failed to download checksums — HTTP " + response.statusCode()
+                    + " from: " + checksumsUrl);
+        }
+        String expected = expectedSha256(response.body(), archiveName);
+        if (expected == null) {
+            throw new IOException("No checksum entry for " + archiveName + " in " + checksumsUrl);
+        }
+        return expected;
+    }
+
+    /** Parses a {@code sha256sum}-format file ("{@code <hash>  <file name>}" per line). */
+    static String expectedSha256(String checksums, String fileName) {
+        for (String line : checksums.split("\\R")) {
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length == 2 && parts[1].equals(fileName)) {
+                return parts[0];
+            }
+        }
+        return null;
+    }
+
+    /** Runs {@code harness install plugin <harness-har>} on the agent with {@code cliHome} as the CLI home. */
+    private static void registerHarPlugin(Node node, FilePath cli, FilePath harPlugin, FilePath cliHome,
+                                          TaskListener log)
+            throws IOException, InterruptedException {
+        Launcher launcher = node.createLauncher(log);
+        ArgumentListBuilder cmd = new ArgumentListBuilder(
+                cli.getRemote(), "install", "plugin", harPlugin.getRemote());
+        int exitCode = launcher.launch()
+                .cmds(cmd)
+                .envs(Map.of(HarnessCliInstallation.HARNESS_CLI_HOME, cliHome.getRemote()))
+                .pwd(cli.getParent())
+                .stdout(log)
+                .stderr(log.getLogger())
+                .join();
+        if (exitCode != 0) {
+            throw new IOException("[Harness CLI] 'harness install plugin' failed with exit code " + exitCode);
+        }
     }
 
     /**
@@ -238,61 +389,42 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         throw lastTimeout;
     }
 
-    /**
-     * Searches for the hc binary in {@code toolHome} after the tar.gz has been extracted.
-     * Tries the root first, then immediate subdirectories (some releases nest inside a folder).
-     */
-    private static FilePath findBinaryAfterExtraction(FilePath toolHome, String binaryName,
-                                                       TaskListener log)
-            throws IOException, InterruptedException {
-
-        // 1. Binary directly in toolHome
-        FilePath direct = toolHome.child(binaryName);
-        if (direct.exists() && direct.length() > MIN_BINARY_SIZE_BYTES) {
-            return direct;
-        }
-
-        // 2. Binary nested one level deep (e.g. hc_1.3.30_linux_x86_64/hc)
-        List<FilePath> children = toolHome.listDirectories();
-        for (FilePath dir : children) {
-            FilePath candidate = dir.child(binaryName);
-            if (candidate.exists() && candidate.length() > MIN_BINARY_SIZE_BYTES) {
-                log.getLogger().println("[Harness CLI] Binary found in " + dir.getName()
-                        + "/ — moving to tool root.");
-                candidate.copyTo(direct);
-                return direct;
-            }
-        }
-
-        throw new IOException("[Harness CLI] Could not find '" + binaryName
-                + "' after extracting the archive. Contents of " + toolHome.getRemote() + ": "
-                + toolHome.list());
-    }
-
     // -------------------------------------------------------------------------
 
-    /** Strips a leading 'v' from a version string. "v1.3.30" → "1.3.30", "1.3.30" → "1.3.30" */
+    /** Validates a pinned version and strips a leading 'v'. "v3.13.0" → "3.13.0" */
+    static String normalizeVersion(String ver) throws IOException {
+        String error = versionError(ver);
+        if (error != null) {
+            throw new AbortException("[Harness CLI] " + error);
+        }
+        return stripLeadingV(ver.trim());
+    }
+
+    /** Returns a user-facing problem with the pinned version, or {@code null} if it is usable. */
+    static String versionError(String ver) {
+        Matcher m = VERSION.matcher(stripLeadingV(StringUtils.trimToEmpty(ver)));
+        if (!m.matches()) {
+            return "Invalid version '" + ver + "'. Expected a release version such as 3.13.0.";
+        }
+        if (Integer.parseInt(m.group(1)) < MIN_MAJOR_VERSION) {
+            return "Version '" + ver + "' cannot be installed. This installer downloads releases from "
+                    + "https://github.com/harness/cli/releases; enter a version listed there, "
+                    + "for example 3.13.0, or leave the field empty for the latest.";
+        }
+        return null;
+    }
+
+    /** Strips a leading 'v' from a version string. "v3.13.0" → "3.13.0", "3.13.0" → "3.13.0" */
     private static String stripLeadingV(String ver) {
         return ver != null && ver.startsWith("v") ? ver.substring(1) : ver;
     }
 
-    /**
-     * Minimal JSON field extractor — avoids pulling in a full JSON library for a single field.
-     * Handles the simple string-value case returned by the GitHub Releases API.
-     */
-    private static String extractJsonStringField(String json, String fieldName) throws IOException {
-        String needle = "\"" + fieldName + "\"";
-        int idx = json.indexOf(needle);
-        if (idx < 0) {
-            throw new IOException("Field '" + fieldName + "' not found in GitHub API response");
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available in this JVM", e);
         }
-        int colon = json.indexOf(':', idx + needle.length());
-        int open  = json.indexOf('"', colon + 1);
-        int close = json.indexOf('"', open + 1);
-        if (open < 0 || close < 0) {
-            throw new IOException("Malformed JSON for field '" + fieldName + "'");
-        }
-        return json.substring(open + 1, close);
     }
 
     // -------------------------------------------------------------------------
@@ -303,12 +435,23 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         @NonNull
         @Override
         public String getDisplayName() {
-            return "Install from GitHub releases (harness/harness-cli)";
+            return "Install from GitHub releases (harness/cli)";
         }
 
         @Override
         public boolean isApplicable(Class<? extends ToolInstallation> toolType) {
             return toolType == HarnessCliInstallation.class;
+        }
+
+        @POST
+        @SuppressWarnings("unused")
+        public FormValidation doCheckVersion(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            if (StringUtils.isBlank(value)) {
+                return FormValidation.ok();
+            }
+            String error = versionError(value);
+            return error == null ? FormValidation.ok() : FormValidation.error(error);
         }
     }
 }

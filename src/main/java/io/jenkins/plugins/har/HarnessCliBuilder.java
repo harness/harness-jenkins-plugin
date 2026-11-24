@@ -12,38 +12,32 @@ import hudson.model.Job;
 import hudson.model.Node;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.Builder;
-import hudson.util.ArgumentListBuilder;
 import hudson.util.ListBoxModel;
-import hudson.util.Secret;
 import io.jenkins.plugins.har.cli.HarnessCliInstallation;
-import io.jenkins.plugins.har.cli.HarnessCliLoginTracker;
-import io.jenkins.plugins.har.cli.HarnessGlobalConfiguration;
-import io.jenkins.plugins.har.cli.HcStep;
+import io.jenkins.plugins.har.cli.HarnessCliSupport;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-import org.kohsuke.stapler.verb.GET;
+import org.kohsuke.stapler.verb.POST;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 
 /**
- * Build step for running Harness CLI (hc) commands in Freestyle jobs.
+ * Build step for running Harness CLI ({@code harness}) commands in Freestyle jobs.
  *
- * <p>Mirrors what the {@code hc(...)} Pipeline step does for Declarative/Scripted pipelines.
- * Auto-runs {@code hc auth login} once per agent, per build using credentials from
- * <b>Manage Jenkins → Configure System → Harness CLI Configuration</b>.
+ * <p>Mirrors what the {@code harness(...)} Pipeline step does for Declarative/Scripted pipelines,
+ * authenticating with the credentials from
+ * <b>Manage Jenkins → System → Harness CLI Configuration</b>.
  *
  * <p>Example commands:
  * <pre>
- *   hc version
- *   hc artifact push rpm my-repo /path/to/file.rpm
- *   hc auth status
+ *   version
+ *   push artifact:rpm my-repo /path/to/file.rpm
+ *   auth status
  * </pre>
  */
 public class HarnessCliBuilder extends Builder {
@@ -80,7 +74,7 @@ public class HarnessCliBuilder extends Builder {
 
         FilePath workspace = build.getWorkspace();
         if (workspace == null) {
-            listener.error("[hc] Workspace is null");
+            listener.error("[harness] Workspace is null");
             return false;
         }
 
@@ -102,71 +96,16 @@ public class HarnessCliBuilder extends Builder {
         workspace.mkdirs();
 
         if (StringUtils.isBlank(command)) {
-            listener.error("[hc] No command provided");
+            listener.error("[harness] No command provided");
             return false;
         }
 
-        boolean isWindows   = !launcher.isUnix();
-        String hcBinaryPath = HcStep.Execution.getHcCliPath(env, isWindows);
-        listener.getLogger().println("[hc] Using binary: " + hcBinaryPath);
-
-        // Auto-login once per agent for this build
-        HarnessCliLoginTracker tracker = build.getAction(HarnessCliLoginTracker.class);
-        if (tracker == null) {
-            tracker = new HarnessCliLoginTracker();
-            build.addAction(tracker);
-        }
-        String nodeName = env.get("NODE_NAME", "");
-        if (tracker.needsLogin(nodeName)) {
-            try {
-                if (performLogin(launcher, workspace, env, hcBinaryPath, isWindows, listener)) {
-                    tracker.recordLogin(hcBinaryPath, workspace.getRemote(), nodeName);
-                }
-            } catch (IOException e) {
-                String msg = ExceptionUtils.getRootCauseMessage(e);
-                listener.error("[hc] Login failed: " + msg);
-                if (msg != null && (msg.contains("No such file or directory")
-                        || msg.contains("Cannot run program")
-                        || msg.contains("error: 2"))) {
-                    listener.error("[hc] Harness CLI binary not found at: " + hcBinaryPath);
-                    listener.error("     → Go to Manage Jenkins → Tools → Harness CLI installations and add an installation.");
-                    listener.error("     → Or install the hc binary on the system PATH of the agent.");
-                }
-                return false;
-            }
-        }
-
-        // Strip leading 'hc' prefix if the user typed the full command (e.g. "hc artifact push ...")
-        String trimmed = command.trim();
-        String[] fullArgs = StringUtils.split(trimmed);
-        String[] args;
-        if (fullArgs.length > 0 && fullArgs[0].equalsIgnoreCase("hc")) {
-            args = new String[fullArgs.length - 1];
-            System.arraycopy(fullArgs, 1, args, 0, args.length);
-        } else {
-            args = fullArgs;
-        }
-
-        ArgumentListBuilder builder = new ArgumentListBuilder();
-        builder.add(hcBinaryPath).add(args);
-        if (isWindows) {
-            builder = builder.toWindowsCommand();
-        }
-
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            int exitCode = launcher.launch()
-                    .envs(env)
-                    .pwd(workspace)
-                    .cmds(builder)
-                    .stdout(outputStream)
-                    .stderr(listener.getLogger())
-                    .join();
-
-            String output = outputStream.toString(StandardCharsets.UTF_8);
-            listener.getLogger().print(output);
-
-            if (exitCode != 0) {
-                listener.error("[hc] Command failed with exit code " + exitCode);
+        String cliPath = HarnessCliSupport.cliPath(env, !launcher.isUnix());
+        try {
+            HarnessCliSupport.Result result =
+                    HarnessCliSupport.run(launcher, workspace, env, StringUtils.split(command.trim()), listener);
+            if (result.exitCode() != 0) {
+                listener.error("[harness] Command failed with exit code " + result.exitCode());
                 return false;
             }
             return true;
@@ -174,86 +113,15 @@ public class HarnessCliBuilder extends Builder {
         } catch (IOException e) {
             if (e.getMessage() != null && (e.getMessage().contains("No such file or directory")
                     || e.getMessage().contains("Cannot run program"))) {
-                listener.error("[hc] Harness CLI binary not found.");
+                listener.error("[harness] Harness CLI binary not found at: " + cliPath);
                 listener.error("     → Go to Manage Jenkins → Tools → Harness CLI installations and add an installation.");
-                listener.error("     → Or set the hc binary on the system PATH of the agent.");
+                listener.error("     → Or install the harness binary on the system PATH of the agent.");
                 listener.error("Error: " + ExceptionUtils.getRootCauseMessage(e));
             } else {
-                listener.error("[hc] Failed to execute command: " + ExceptionUtils.getRootCauseMessage(e));
+                listener.error("[harness] Failed to execute command: " + ExceptionUtils.getRootCauseMessage(e));
             }
             return false;
         }
-    }
-
-    /**
-     * @return {@code true} if login completed successfully; {@code false} if skipped
-     */
-    private static boolean performLogin(Launcher launcher, FilePath workspace, EnvVars env,
-                                     String hcBinaryPath, boolean isWindows,
-                                     BuildListener listener) throws IOException, InterruptedException {
-
-        HarnessGlobalConfiguration config = HarnessGlobalConfiguration.get();
-        if (config == null) {
-            listener.getLogger().println("[hc] WARNING: HarnessGlobalConfiguration not found — skipping auto-login.");
-            return false;
-        }
-
-        String apiUrl   = config.getApiUrl();
-        String apiToken = Secret.toString(config.getApiToken());
-
-        if (StringUtils.isBlank(apiToken)) {
-            listener.getLogger().println(
-                    "[hc] WARNING: Harness API Token is not configured. "
-                    + "Go to Manage Jenkins → Configure System → Harness CLI Configuration.");
-            return false;
-        }
-
-        String effectiveUrl = StringUtils.defaultIfBlank(apiUrl, Constants.DEFAULT_BASE_URL);
-        listener.getLogger().println("[hc] Running 'hc auth login' against: " + effectiveUrl);
-
-        String accountId = HcStep.Execution.extractAccountIdFromToken(apiToken);
-        if (StringUtils.isBlank(accountId)) {
-            throw new IOException(
-                    "[hc] Could not extract Account ID from the API token. "
-                    + "Expected PAT format: pat.<AccountID>.<random>.<random>");
-        }
-
-        ArgumentListBuilder builder = new ArgumentListBuilder();
-        builder.add(hcBinaryPath)
-               .add("auth").add("login")
-               .add("--api-url=" + effectiveUrl);
-        builder.addMasked("--api-token=" + apiToken);
-        builder.add("--account=" + accountId)
-               .add("--non-interactive");
-
-        String orgId = config.getOrgId();
-        if (StringUtils.isNotBlank(orgId)) {
-            builder.add("--org=" + orgId);
-        }
-        String projectId = config.getProjectId();
-        if (StringUtils.isNotBlank(projectId)) {
-            builder.add("--project=" + projectId);
-        }
-
-        if (isWindows) {
-            builder = builder.toWindowsCommand();
-        }
-
-        int exitCode = launcher.launch()
-                .envs(env)
-                .pwd(workspace)
-                .cmds(builder)
-                .stdout(listener.getLogger())
-                .stderr(listener.getLogger())
-                .join();
-
-        if (exitCode != 0) {
-            throw new IOException(
-                    "'hc auth login' failed with exit code " + exitCode
-                    + ". Check credentials under Manage Jenkins → Configure System → Harness CLI Configuration.");
-        }
-        listener.getLogger().println("[hc] Login successful.");
-        return true;
     }
 
     private HarnessCliInstallation getInstallation() {
@@ -279,7 +147,7 @@ public class HarnessCliBuilder extends Builder {
         @NonNull
         @Override
         public String getDisplayName() {
-            return "Run Harness CLI (hc) command";
+            return "Run Harness CLI command";
         }
 
         @Override
@@ -293,11 +161,11 @@ public class HarnessCliBuilder extends Builder {
                     .getInstallations();
         }
 
-        @GET
+        @POST
         public ListBoxModel doFillHarnessCliInstallationItems(@AncestorInPath Job<?, ?> job) {
             job.checkPermission(Item.CONFIGURE);
             ListBoxModel items = new ListBoxModel();
-            items.add("(Use hc from system PATH)", "");
+            items.add("(Use harness from system PATH)", "");
             for (HarnessCliInstallation inst : getInstallations()) {
                 items.add(inst.getName(), inst.getName());
             }

@@ -22,17 +22,26 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Represents a Harness CLI (hc) tool installation in Jenkins.
+ * Represents a Harness CLI ({@code harness}) tool installation in Jenkins.
  * <p>
  * Admins configure this under Manage Jenkins → Tools → Harness CLI installations.
  * The installation directory is exposed as the {@value #HARNESS_CLI_PATH} environment variable
- * so that {@link HcStep} can locate the binary at runtime.
+ * so that {@link HarnessStep} can locate the binary at runtime.
  */
 public class HarnessCliInstallation extends ToolInstallation
         implements NodeSpecific<HarnessCliInstallation>, EnvironmentSpecific<HarnessCliInstallation> {
 
-    /** Environment variable set to the directory that contains the hc binary. */
+    /** Environment variable set to the directory that contains the harness binary. */
     public static final String HARNESS_CLI_PATH = "HARNESS_CLI_PATH";
+
+    /**
+     * Environment variable the harness CLI reads to locate its home directory
+     * (registered plugins under {@code bin/} and their command specs under {@code spec/}).
+     */
+    public static final String HARNESS_CLI_HOME = "HARNESS_CLI_HOME";
+
+    /** Directory inside the tool home that the installer uses as {@value #HARNESS_CLI_HOME}. */
+    public static final String CLI_HOME_DIR = "cli-home";
 
     @DataBoundConstructor
     public HarnessCliInstallation(String name, String home, List<? extends ToolProperty<?>> properties) {
@@ -70,7 +79,7 @@ public class HarnessCliInstallation extends ToolInstallation
         @NonNull
         @Override
         public String getDisplayName() {
-            return "Harness CLI (hc)";
+            return "Harness CLI";
         }
 
         @Override

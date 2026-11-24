@@ -4,7 +4,7 @@
         <f:textbox/>
     </f:entry>
     <f:entry title="${%Harness CLI execution path}" field="home"
-             description="Absolute path to the directory containing the hc binary. Leave empty to use the installer.">
+             description="Absolute path to the directory containing the harness binary. Leave empty to use the installer.">
         <f:textbox/>
     </f:entry>
 </j:jelly>

@@ -2,8 +2,8 @@
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
     <f:section title="Harness CLI Configuration">
         <f:description>
-            Used to run &lt;code&gt;hc auth login&lt;/code&gt; automatically before the first
-            &lt;code&gt;hc&lt;/code&gt; pipeline step in each build.
+            Passed to every Harness CLI command run by the &lt;code&gt;harness&lt;/code&gt; pipeline step
+            and the Freestyle build step. Nothing is stored on the agents.
             API URL and API Token are mandatory; Org ID and Project ID are optional.
         </f:description>
         <f:entry title="API URL"
@@ -13,7 +13,7 @@
         </f:entry>
         <f:entry title="API Token"
                  field="apiToken"
-                 description="Personal Access Token (PAT) from Harness — required">
+                 description="Harness personal access token (pat.…) or service account token (sat.…) — required">
             <f:password/>
         </f:entry>
         <f:entry title="Organization ID"

@@ -12,28 +12,28 @@ import hudson.model.TaskListener;
 import hudson.tasks.BuildWrapperDescriptor;
 import hudson.util.ListBoxModel;
 import io.jenkins.plugins.har.cli.HarnessCliInstallation;
-import io.jenkins.plugins.har.cli.HarnessCliLoginTracker;
-import io.jenkins.plugins.har.cli.HcStep;
+import io.jenkins.plugins.har.cli.HarnessCliSupport;
 import jenkins.tasks.SimpleBuildWrapper;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-import org.kohsuke.stapler.verb.GET;
+import org.kohsuke.stapler.verb.POST;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
-import java.util.Collection;
 
 /**
- * Build Environment wrapper that sets up Harness CLI (hc) for the entire Freestyle build.
+ * Build Environment wrapper that sets up the Harness CLI ({@code harness}) for the entire Freestyle build.
  *
  * <p>Appears as the <b>"Set up Harness CLI environment"</b> checkbox under
  * <b>Build Environment</b> in a Freestyle job configuration.
  *
  * <p>When enabled, it sets the {@value HarnessCliInstallation#HARNESS_CLI_PATH} environment
- * variable for every build step and shell script in the build — so you can call {@code hc}
- * directly in any Execute Shell step without specifying the full path.
+ * variable (and, for installer-managed installations, {@value HarnessCliInstallation#HARNESS_CLI_HOME}
+ * pointing to a CLI home private to the workspace) for every build step and shell script in the build,
+ * so an Execute Shell step can run {@code "$HARNESS_CLI_PATH/harness"}. API credentials are not
+ * exported to shell steps.
  *
  * <p>This is the Freestyle equivalent of the Pipeline directive:
  * <pre>{@code
@@ -62,10 +62,8 @@ public class HarnessCliWrapper extends SimpleBuildWrapper {
                       Launcher launcher, TaskListener listener, EnvVars initialEnvironment)
             throws IOException, InterruptedException {
 
-        context.setDisposer(new HarnessDisposer());
-
         if (harnessCliInstallation == null || harnessCliInstallation.isEmpty()) {
-            listener.getLogger().println("[Harness CLI] No installation selected — using hc from system PATH.");
+            listener.getLogger().println("[Harness CLI] No installation selected — using harness from system PATH.");
             return;
         }
 
@@ -90,6 +88,11 @@ public class HarnessCliWrapper extends SimpleBuildWrapper {
             context.env(entry.getKey(), entry.getValue());
         }
 
+        FilePath cliHome = HarnessCliSupport.cliHome(envVars, workspace, !launcher.isUnix());
+        if (cliHome != null) {
+            context.env(HarnessCliInstallation.HARNESS_CLI_HOME, cliHome.getRemote());
+        }
+
         listener.getLogger().println("[Harness CLI] Using installation: " + harnessCliInstallation);
         listener.getLogger().println("[Harness CLI] HARNESS_CLI_PATH set to: "
                 + envVars.get(HarnessCliInstallation.HARNESS_CLI_PATH));
@@ -109,30 +112,6 @@ public class HarnessCliWrapper extends SimpleBuildWrapper {
             }
         }
         return null;
-    }
-
-    private static final class HarnessDisposer extends SimpleBuildWrapper.Disposer {
-        private static final long serialVersionUID = 1L;
-
-        @Override
-        public void tearDown(@NonNull Run<?, ?> build, @NonNull FilePath workspace,
-                             @NonNull Launcher launcher, @NonNull TaskListener listener)
-                throws IOException, InterruptedException {
-            HarnessCliLoginTracker tracker = build.getAction(HarnessCliLoginTracker.class);
-            if (tracker == null || !tracker.markLoggedOut()) {
-                return;
-            }
-            Collection<HarnessCliLoginTracker.AgentSession> sessions = tracker.getSessions();
-            if (sessions.isEmpty()) {
-                return;
-            }
-            // Freestyle builds run on a single agent for the wrapper lifecycle.
-            HarnessCliLoginTracker.AgentSession session = sessions.iterator().next();
-            EnvVars env = build.getEnvironment(listener);
-            boolean isWindows = !launcher.isUnix();
-            HcStep.Execution.performLogout(
-                    launcher, workspace, env, session.getHcBinaryPath(), isWindows, listener);
-        }
     }
 
     private static hudson.model.Node workspaceToNode(FilePath workspace) {
@@ -176,11 +155,11 @@ public class HarnessCliWrapper extends SimpleBuildWrapper {
                     .getInstallations();
         }
 
-        @GET
+        @POST
         public ListBoxModel doFillHarnessCliInstallationItems(@AncestorInPath Job<?, ?> job) {
             job.checkPermission(Item.CONFIGURE);
             ListBoxModel items = new ListBoxModel();
-            items.add("(Use hc from system PATH)", "");
+            items.add("(Use harness from system PATH)", "");
             for (HarnessCliInstallation inst : getInstallations()) {
                 items.add(inst.getName(), inst.getName());
             }

@@ -8,7 +8,7 @@ import java.util.regex.Pattern;
 public class OsArchDetectorCallable extends MasterToSlaveCallable<String, IOException> {
     private static final long serialVersionUID = 1L;
     private static final Pattern OS_ARCH_SEPARATOR = Pattern.compile("\\|");
-    private static final String DEFAULT_ARCH = "x86_64";
+    private static final String DEFAULT_ARCH = "amd64";
 
     @Override
     public String call() throws IOException {

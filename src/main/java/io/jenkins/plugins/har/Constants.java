@@ -10,8 +10,8 @@ public final class Constants {
     public static final int DEFAULT_RETRY_COUNT = 0;
 
     //harness cli urls
-    public static final String GITHUB_RELEASES_BASE = "https://github.com/harness/harness-cli/releases";
-    public static final String GITHUB_API_LATEST = "https://api.github.com/repos/harness/harness-cli/releases/latest";
+    public static final String GITHUB_RELEASES_BASE = "https://github.com/harness/cli/releases";
+    public static final String GITHUB_API_RELEASES = "https://api.github.com/repos/harness/cli/releases?per_page=50";
 
     private Constants() {
     }

@@ -19,14 +19,14 @@ import edu.umd.cs.findbugs.annotations.NonNull;
  * Global Jenkins configuration for the Harness CLI plugin.
  * Appears under <b>Manage Jenkins → Configure System → Harness CLI Configuration</b>.
  *
- * <p>These credentials are used by the {@link HcStep} pipeline step to automatically
- * run {@code hc auth login} before the first {@code hc} command in each build,
+ * <p>These credentials are passed to every {@code harness} process started by the {@link HarnessStep}
+ * pipeline step and the Freestyle build step (see {@link HarnessCliSupport}),
  * so individual pipeline steps do not need to handle authentication themselves.
  *
  * <p>TODO: Open Manage Jenkins → Configure System and fill in:
  * <ul>
  *   <li>API URL      — Harness API endpoint (default: https://app.harness.io)</li>
- *   <li>API Token    — a Personal Access Token (PAT) from Harness (mandatory)</li>
+ *   <li>API Token    — a Harness personal access token or service account token (mandatory)</li>
  *   <li>Org ID       — Harness organisation ID (optional)</li>
  *   <li>Project ID   — Harness project ID (optional)</li>
  * </ul>
@@ -51,7 +51,7 @@ public class HarnessGlobalConfiguration extends GlobalConfiguration {
     }
 
     // -------------------------------------------------------------------------
-    // Getters (used by Jelly and by HcStep at runtime)
+    // Getters (used by Jelly and by HarnessStep at runtime)
     // -------------------------------------------------------------------------
 
     public String getApiUrl() {
@@ -116,7 +116,7 @@ public class HarnessGlobalConfiguration extends GlobalConfiguration {
     public FormValidation doCheckApiToken(@QueryParameter String value) {
         Jenkins.get().checkPermission(Jenkins.ADMINISTER);
         if (StringUtils.isBlank(value)) {
-            return FormValidation.warning("API Token is required for 'hc auth login'.");
+            return FormValidation.warning("API Token is required to authenticate the Harness CLI.");
         }
         return FormValidation.ok();
     }

@@ -7,6 +7,7 @@ import hudson.Launcher;
 import hudson.ProxyConfiguration;
 import hudson.model.Node;
 import hudson.model.TaskListener;
+import hudson.remoting.VirtualChannel;
 import hudson.tools.ToolInstallation;
 import hudson.tools.ToolInstaller;
 import hudson.tools.ToolInstallerDescriptor;
@@ -15,6 +16,7 @@ import hudson.util.FormValidation;
 import io.jenkins.plugins.har.Constants;
 import io.jenkins.plugins.har.cli.HarnessCliInstallation;
 import io.jenkins.plugins.har.cli.HarnessOsUtils;
+import jenkins.MasterToSlaveFileCallable;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONException;
@@ -26,16 +28,21 @@ import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.verb.POST;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -167,48 +174,127 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
         // Look the release up before deleting anything: a mistyped version must not wipe a working installation.
         String expectedSha256 = fetchExpectedSha256(resolvedVersion, archiveName, log);
 
-        // Start from an empty tool home so binaries from a previous version (or the retired hc CLI) do not linger.
-        toolHome.deleteContents();
+        // Build the new installation next to the live one and swap it in only after every step has succeeded,
+        // so a failed download, checksum, extract or plugin registration leaves the working install untouched.
+        FilePath toolsDir = toolHome.getParent();
+        if (toolsDir == null) {
+            throw new AbortException("[Harness CLI] Tool home has no parent directory: " + toolHome.getRemote());
+        }
+        FilePath staging = toolsDir.child(".staging-" + UUID.randomUUID());
+        try {
+            staging.mkdirs();
+            installInto(staging, node, isWindows, zip, archiveName, downloadUrl, expectedSha256, resolvedVersion,
+                    cliHome, log);
+            String backup = toolHome.act(new SwapDirectories(staging.getRemote()));
+            deleteQuietly(toolsDir.child(backup), log);
+        } finally {
+            deleteQuietly(staging, log);
+        }
 
+        log.getLogger().println("[Harness CLI] Installation complete: " + cliPath.getRemote()
+                + " (v" + resolvedVersion + ")");
+
+        return toolHome;
+    }
+
+    private static void installInto(FilePath staging, Node node, boolean isWindows, boolean zip, String archiveName,
+                                    String downloadUrl, String expectedSha256, String resolvedVersion,
+                                    FilePath finalCliHome, TaskListener log)
+            throws IOException, InterruptedException {
         log.getLogger().println("[Harness CLI] Downloading v" + resolvedVersion + ": " + downloadUrl);
-        FilePath archive = toolHome.child(archiveName);
+        FilePath archive = staging.child(archiveName);
         String actualSha256 = download(downloadUrl, archive, log);
         if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
-            archive.delete();
             throw new AbortException("[Harness CLI] SHA-256 mismatch for " + archiveName
                     + ": expected " + expectedSha256 + ", got " + actualSha256);
         }
         log.getLogger().println("[Harness CLI] SHA-256 verified for " + archiveName);
 
         if (zip) {
-            archive.unzip(toolHome);
+            archive.unzip(staging);
         } else {
-            archive.untar(toolHome, FilePath.TarCompression.GZIP);
+            archive.untar(staging, FilePath.TarCompression.GZIP);
         }
         archive.delete();
 
-        FilePath extractedHarPlugin = toolHome.child(HarnessOsUtils.getHarPluginBinaryName(isWindows));
-        for (FilePath binary : new FilePath[] {cliPath, extractedHarPlugin}) {
+        FilePath stagedCli = staging.child(HarnessOsUtils.getBinaryName(isWindows));
+        FilePath extractedHarPlugin = staging.child(HarnessOsUtils.getHarPluginBinaryName(isWindows));
+        for (FilePath binary : new FilePath[] {stagedCli, extractedHarPlugin}) {
             if (!binary.exists() || binary.length() <= MIN_BINARY_SIZE_BYTES) {
                 throw new IOException("[Harness CLI] Could not find '" + binary.getName()
                         + "' after extracting " + archiveName + ". Contents of "
-                        + toolHome.getRemote() + ": " + toolHome.list());
+                        + staging.getRemote() + ": " + staging.list());
             }
             if (!isWindows) {
                 binary.chmod(EXECUTABLE_MODE);
             }
         }
 
-        registerHarPlugin(node, cliPath, extractedHarPlugin, cliHome, log);
+        FilePath stagedCliHome = staging.child(HarnessCliInstallation.CLI_HOME_DIR);
+        registerHarPlugin(node, stagedCli, extractedHarPlugin, stagedCliHome, log);
         extractedHarPlugin.delete();
+        repointSpecs(stagedCliHome, finalCliHome);
 
-        // Write the version marker so future runs can skip the download
-        versionMarker.write(resolvedVersion, "UTF-8");
+        staging.child(VERSION_MARKER_FILE).write(resolvedVersion, "UTF-8");
+    }
 
-        log.getLogger().println("[Harness CLI] Installation complete: " + cliPath.getRemote()
-                + " (v" + resolvedVersion + ")");
+    /**
+     * The spec written by {@code harness install plugin} records the absolute path of the plugin binary,
+     * which at that point lives in the staging directory.
+     */
+    private static void repointSpecs(FilePath stagedCliHome, FilePath finalCliHome)
+            throws IOException, InterruptedException {
+        FilePath specDir = stagedCliHome.child("spec");
+        int rewritten = 0;
+        for (FilePath spec : specDir.list()) {
+            String text = spec.readToString();
+            if (text.contains(stagedCliHome.getRemote())) {
+                spec.write(text.replace(stagedCliHome.getRemote(), finalCliHome.getRemote()), "UTF-8");
+                rewritten++;
+            }
+        }
+        if (rewritten == 0) {
+            throw new IOException("[Harness CLI] 'harness install plugin' wrote no spec referencing "
+                    + stagedCliHome.getRemote() + " in " + specDir.getRemote());
+        }
+    }
 
-        return toolHome;
+    private static void deleteQuietly(FilePath dir, TaskListener log) {
+        try {
+            if (dir.exists()) {
+                dir.deleteRecursive();
+            }
+        } catch (IOException | InterruptedException e) {
+            log.getLogger().println("[Harness CLI] Could not remove " + dir.getRemote() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Renames the live tool home aside and the staged directory into its place, restoring the old one
+     * if the second rename fails. Returns the name of the old directory, a sibling of the tool home.
+     */
+    static final class SwapDirectories extends MasterToSlaveFileCallable<String> {
+        private static final long serialVersionUID = 1L;
+        private final String stagingPath;
+
+        SwapDirectories(String stagingPath) {
+            this.stagingPath = stagingPath;
+        }
+
+        @Override
+        public String invoke(File toolHome, VirtualChannel channel) throws IOException {
+            Path target = toolHome.toPath();
+            String backupName = ".old-" + UUID.randomUUID();
+            Path backup = target.resolveSibling(backupName);
+            Files.move(target, backup, StandardCopyOption.ATOMIC_MOVE);
+            try {
+                Files.move(Path.of(stagingPath), target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                Files.move(backup, target, StandardCopyOption.ATOMIC_MOVE);
+                throw e;
+            }
+            return backupName;
+        }
     }
 
     // -------------------------------------------------------------------------

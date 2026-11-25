@@ -9,7 +9,7 @@ A Jenkins plugin that integrates the [Harness CLI (`harness`)](https://github.co
 ## Prerequisites
 
 - A Harness account (any tier)
-- A Harness personal access token (`pat.…`) or service account token (`sat.…`)
+- A Harness personal access token (`pat.…`), service account token (`sat.…`) or scoped token (`st.…`)
 
 ---
 
@@ -60,7 +60,7 @@ Go to **Manage Jenkins** → **System** and then navigate to **Harness CLI Confi
 | Field | Description |
 |---|---|
 | **API URL** | Harness API endpoint. For example, `https://app.harness.io`. |
-| **API Token** | Personal access token or service account token - stored as a Jenkins secret. |
+| **API Token** | Personal access token, service account token or scoped token - stored as a Jenkins secret. |
 | **Organization ID** | Optional. Your Harness Organization slug. For example, `default`. |
 | **Project ID** | Optional. Your Harness Project slug. |
 
@@ -71,8 +71,7 @@ Every Harness CLI command run by the plugin receives these values as environment
 A job can use its own credentials instead of the global ones. For each command, the first match wins:
 
 1. `--profile <name>` in the command, or `HARNESS_PROFILE` set in the build environment: a profile saved earlier with `harness auth login`.
-2. `HARNESS_API_KEY` set in the build environment. Set `HARNESS_API_URL`, `HARNESS_ORG` and `HARNESS_PROJECT` as needed too; the global values are not mixed in.
-3. The global **Harness CLI Configuration**.
+2. `HARNESS_API_KEY` set in the build environment. Set `HARNESS_API_URL`, `HARNESS_ORG` and `HARNESS_PROJECT` as needed too; the global values are not mixed in.3. The global **Harness CLI Configuration**.
 
 The recommended way is a Jenkins **Secret text** credential bound with `withCredentials`, which Jenkins also masks in the log:
 

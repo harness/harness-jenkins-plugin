@@ -13,7 +13,7 @@
         </f:entry>
         <f:entry title="API Token"
                  field="apiToken"
-                 description="Harness personal access token (pat.…) or service account token (sat.…) — required">
+                 description="Harness personal access token (pat.…), service account token (sat.…) or scoped token (st.…) — required">
             <f:password/>
         </f:entry>
         <f:entry title="Organization ID"

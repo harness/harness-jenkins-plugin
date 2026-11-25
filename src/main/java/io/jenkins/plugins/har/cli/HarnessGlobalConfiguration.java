@@ -26,7 +26,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
  * <p>TODO: Open Manage Jenkins → Configure System and fill in:
  * <ul>
  *   <li>API URL      — Harness API endpoint (default: https://app.harness.io)</li>
- *   <li>API Token    — a Harness personal access token or service account token (mandatory)</li>
+ *   <li>API Token    — a Harness personal access token, service account token or scoped token (mandatory)</li>
  *   <li>Org ID       — Harness organisation ID (optional)</li>
  *   <li>Project ID   — Harness project ID (optional)</li>
  * </ul>

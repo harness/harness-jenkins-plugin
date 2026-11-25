@@ -3,13 +3,18 @@ package io.jenkins.plugins.har.cli;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.AbortException;
 import hudson.EnvVars;
 import hudson.FilePath;
 import hudson.model.TaskListener;
 import hudson.util.Secret;
+import hudson.util.StreamTaskListener;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -78,6 +83,23 @@ class HarnessCliSupportTest {
     }
 
     @Test
+    void buildApiKeyWithoutApiUrlWarnsThatTheDefaultHostIsUsed(JenkinsRule j) throws Exception {
+        configureGlobalToken();
+        FilePath ws = new FilePath(tmp.resolve("ws").toFile());
+
+        ByteArrayOutputStream withoutUrl = new ByteArrayOutputStream();
+        HarnessCliSupport.commandEnvironment(new EnvVars("HARNESS_API_KEY", "pat.ENV.env.secret"),
+                new String[] {"version"}, ws, false, new StreamTaskListener(withoutUrl, StandardCharsets.UTF_8));
+        assertTrue(withoutUrl.toString(StandardCharsets.UTF_8).contains("without HARNESS_API_URL"));
+
+        ByteArrayOutputStream withUrl = new ByteArrayOutputStream();
+        HarnessCliSupport.commandEnvironment(
+                new EnvVars("HARNESS_API_KEY", "pat.ENV.env.secret", "HARNESS_API_URL", "https://example.invalid"),
+                new String[] {"version"}, ws, false, new StreamTaskListener(withUrl, StandardCharsets.UTF_8));
+        assertFalse(withUrl.toString(StandardCharsets.UTF_8).contains("WARNING"));
+    }
+
+    @Test
     void eachWorkspaceGetsItsOwnCliHomeWithCurrentSpecs(JenkinsRule j) throws Exception {
         FilePath tool = new FilePath(tmp.resolve("tool").toFile());
         FilePath sharedSpec = tool.child("cli-home/spec/har.spec.yaml");
@@ -99,6 +121,16 @@ class HarnessCliSupportTest {
         HarnessCliSupport.cliHome(env, ws1, false);
         assertEquals("version: 2", home1.child("spec/har.spec.yaml").readToString());
         assertEquals(1, home1.child("spec").list().size());
+    }
+
+    @Test
+    void workspaceWithoutTempDirFailsInsteadOfSharingTheToolHome(JenkinsRule j) throws Exception {
+        FilePath tool = new FilePath(tmp.resolve("tool").toFile());
+        tool.child("cli-home/bin/harness-har").write("binary", "UTF-8");
+        EnvVars env = new EnvVars("HARNESS_CLI_PATH", tool.getRemote());
+
+        assertThrows(AbortException.class,
+                () -> HarnessCliSupport.cliHome(env, new FilePath(new File(File.separator)), false));
     }
 
     @Test

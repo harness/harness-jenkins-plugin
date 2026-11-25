@@ -1,5 +1,6 @@
 package io.jenkins.plugins.har.cli;
 
+import hudson.AbortException;
 import hudson.EnvVars;
 import hudson.FilePath;
 import hudson.Launcher;
@@ -139,7 +140,8 @@ public final class HarnessCliSupport {
         }
         FilePath tempDir = WorkspaceList.tempDir(workspace);
         if (tempDir == null) {
-            return sharedHome;
+            throw new AbortException("[harness] Cannot create a private CLI home for workspace "
+                    + workspace.getRemote() + ": it has no parent directory for temporary files.");
         }
         FilePath home = tempDir.child(WORKSPACE_CLI_HOME_DIR);
         syncSpecs(sharedHome.child("spec"), home.child("spec"));
@@ -206,6 +208,12 @@ public final class HarnessCliSupport {
         }
         if (StringUtils.isNotBlank(env.get(ENV_API_KEY))) {
             listener.getLogger().println("[harness] Using " + ENV_API_KEY + " from the build environment.");
+            if (StringUtils.isBlank(env.get(ENV_API_URL))) {
+                listener.getLogger().println("[harness] WARNING: " + ENV_API_KEY + " is set without " + ENV_API_URL
+                        + ", so the CLI sends the token to its default host (app.harness.io). "
+                        + "The URL in Harness CLI Configuration is not used with a build token; "
+                        + "set " + ENV_API_URL + " if your account is on another domain.");
+            }
             return commandEnv;
         }
 

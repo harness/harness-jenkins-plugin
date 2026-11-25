@@ -144,7 +144,12 @@ class HarnessCliInstallerFlowTest {
     private FilePath install(HarnessCliInstallation tool, String version) throws Exception {
         ByteArrayOutputStream log = new ByteArrayOutputStream();
         TaskListener listener = new StreamTaskListener(log, StandardCharsets.UTF_8);
-        return new HarnessCliGitHubInstaller(version).performInstallation(tool, Jenkins.get(), listener);
+        try {
+            return new HarnessCliGitHubInstaller(version).performInstallation(tool, Jenkins.get(), listener);
+        } finally {
+            System.out.println("--- installer log (" + tool.getName() + " " + version + ")\n"
+                    + log.toString(StandardCharsets.UTF_8));
+        }
     }
 
     private HarnessCliInstallation tool(String name, String version) throws IOException {
@@ -189,7 +194,10 @@ class HarnessCliInstallerFlowTest {
         Path dir = Files.createDirectories(tmp.resolve("bundle-" + version));
         String padding = "#" + "x".repeat(1_100_000) + "\n";
         Files.writeString(dir.resolve("harness"), "#!/bin/sh\n"
+                + "set -e\n"
                 + "if [ \"$1\" = install ] && [ \"$2\" = plugin ]; then\n"
+                + "  : \"${HARNESS_CLI_HOME:?HARNESS_CLI_HOME is not set}\"\n"
+                + "  echo \"fake install: home=$HARNESS_CLI_HOME plugin=$3\"\n"
                 + "  mkdir -p \"$HARNESS_CLI_HOME/bin\" \"$HARNESS_CLI_HOME/spec\"\n"
                 + "  cp \"$3\" \"$HARNESS_CLI_HOME/bin/harness-har\"\n"
                 + "  echo \"binary_path: $HARNESS_CLI_HOME/bin/harness-har\" > \"$HARNESS_CLI_HOME/spec/har.spec.yaml\"\n"

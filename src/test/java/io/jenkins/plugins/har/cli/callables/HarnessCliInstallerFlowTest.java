@@ -11,6 +11,7 @@ import hudson.AbortException;
 import hudson.FilePath;
 import hudson.model.TaskListener;
 import hudson.tools.InstallSourceProperty;
+import hudson.util.FormValidation;
 import hudson.util.StreamTaskListener;
 import io.jenkins.plugins.har.cli.HarnessCliInstallation;
 import io.jenkins.plugins.har.cli.HarnessOsUtils;
@@ -60,6 +61,7 @@ class HarnessCliInstallerFlowTest {
     private HttpClient originalClient;
     private final Map<String, byte[]> responses = new ConcurrentHashMap<>();
     private final AtomicInteger requests = new AtomicInteger();
+    private final java.util.Set<String> failing = ConcurrentHashMap.newKeySet();
 
     @BeforeEach
     void startFakeGitHub() throws Exception {
@@ -67,8 +69,11 @@ class HarnessCliInstallerFlowTest {
         server = HttpServer.create(new java.net.InetSocketAddress("localhost", 0), 0);
         server.createContext("/", exchange -> {
             requests.incrementAndGet();
-            byte[] body = responses.get(exchange.getRequestURI().getPath());
-            if (body == null) {
+            String path = exchange.getRequestURI().getPath();
+            byte[] body = responses.get(path);
+            if (failing.contains(path)) {
+                exchange.sendResponseHeaders(500, -1);
+            } else if (body == null) {
                 exchange.sendResponseHeaders(404, -1);
             } else {
                 exchange.sendResponseHeaders(200, body.length);
@@ -91,8 +96,8 @@ class HarnessCliInstallerFlowTest {
 
     @Test
     void installsOnceThenReusesAndUpgradesInPlace(JenkinsRule j) throws Exception {
-        publish("3.20.0", true);
-        publish("3.21.0", true);
+        publish("3.20.0", Broken.NONE);
+        publish("3.21.0", Broken.NONE);
         HarnessCliInstallation tool = tool("fake-cli", "3.20.0");
 
         FilePath home = install(tool, "3.20.0");
@@ -113,8 +118,8 @@ class HarnessCliInstallerFlowTest {
 
     @Test
     void failedInstallLeavesTheWorkingInstallUntouched(JenkinsRule j) throws Exception {
-        publish("3.20.0", true);
-        publish("3.21.0", false);
+        publish("3.20.0", Broken.NONE);
+        publish("3.21.0", Broken.BAD_CHECKSUM);
         HarnessCliInstallation tool = tool("fake-cli", "3.20.0");
         FilePath home = install(tool, "3.20.0");
 
@@ -124,6 +129,25 @@ class HarnessCliInstallerFlowTest {
         AbortException unknown = assertThrows(AbortException.class, () -> install(tool, "3.22.0"));
         assertTrue(unknown.getMessage().contains("was not found"), unknown.getMessage());
 
+        publish("3.23.0", Broken.INSTALL_FAILS);
+        IOException rejected = assertThrows(IOException.class, () -> install(tool, "3.23.0"));
+        assertTrue(rejected.getMessage().contains("'harness install plugin' failed"), rejected.getMessage());
+
+        publish("3.24.0", Broken.NO_PLUGIN);
+        IOException noPlugin = assertThrows(IOException.class, () -> install(tool, "3.24.0"));
+        assertTrue(noPlugin.getMessage().contains("Could not find 'harness-har'"), noPlugin.getMessage());
+
+        publish("3.25.0", Broken.NO_CHECKSUM_ENTRY);
+        IOException noEntry = assertThrows(IOException.class, () -> install(tool, "3.25.0"));
+        assertTrue(noEntry.getMessage().contains("No checksum entry"), noEntry.getMessage());
+
+        publish("3.26.0", Broken.CHECKSUMS_SERVER_ERROR);
+        IOException serverError = assertThrows(IOException.class, () -> install(tool, "3.26.0"));
+        assertTrue(serverError.getMessage().contains("HTTP 500"), serverError.getMessage());
+
+        AbortException invalid = assertThrows(AbortException.class, () -> install(tool, "1.3.47"));
+        assertTrue(invalid.getMessage().contains("cannot be installed"), invalid.getMessage());
+
         assertEquals("3.20.0", marker(home));
         assertRegistered(home);
         assertNoLeftovers(home);
@@ -131,7 +155,7 @@ class HarnessCliInstallerFlowTest {
 
     @Test
     void latestVersionIsResolvedFromTheReleaseList(JenkinsRule j) throws Exception {
-        publish("3.30.0", true);
+        publish("3.30.0", Broken.NONE);
         responses.put("/repos/harness/cli/releases",
                 "[{\"tag_name\":\"har/v1.9.0\"},{\"tag_name\":\"v3.30.0\"},{\"tag_name\":\"v3.29.0\"}]"
                         .getBytes(StandardCharsets.UTF_8));
@@ -139,6 +163,19 @@ class HarnessCliInstallerFlowTest {
 
         FilePath home = install(tool, "");
         assertEquals("3.30.0", marker(home));
+
+        int before = requests.get();
+        install(tool("fake-latest-2", ""), "");
+        assertEquals(before + 2, requests.get(), "checksums and bundle only; the latest version comes from the cache");
+    }
+
+    @Test
+    void versionFieldAcceptsEmptyOrCliReleasesOnly(JenkinsRule j) {
+        HarnessCliGitHubInstaller.DescriptorImpl descriptor =
+                j.jenkins.getDescriptorByType(HarnessCliGitHubInstaller.DescriptorImpl.class);
+        assertEquals(FormValidation.Kind.OK, descriptor.doCheckVersion("").kind);
+        assertEquals(FormValidation.Kind.OK, descriptor.doCheckVersion("3.13.0").kind);
+        assertEquals(FormValidation.Kind.ERROR, descriptor.doCheckVersion("1.3.47").kind);
     }
 
     private FilePath install(HarnessCliInstallation tool, String version) throws Exception {
@@ -175,28 +212,36 @@ class HarnessCliInstallerFlowTest {
         }
     }
 
-    /** Publishes a bundle for {@code version}; a bad checksum simulates a corrupted download. */
-    private void publish(String version, boolean validChecksum) throws Exception {
+    /** How a published release is broken, if at all. */
+    private enum Broken { NONE, BAD_CHECKSUM, NO_CHECKSUM_ENTRY, CHECKSUMS_SERVER_ERROR, INSTALL_FAILS, NO_PLUGIN }
+
+    private void publish(String version, Broken broken) throws Exception {
         String os = HarnessOsUtils.getOs();
         String arch = HarnessOsUtils.getArch();
         String archive = "harness-bundle_" + version + "_" + os + "_" + arch + ".tar.gz";
-        byte[] bundle = bundle(version);
-        String sha = validChecksum
-                ? HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bundle))
-                : "0".repeat(64);
+        byte[] bundle = bundle(version, broken);
+        String sha = broken == Broken.BAD_CHECKSUM
+                ? "0".repeat(64)
+                : HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bundle));
+        String listedName = broken == Broken.NO_CHECKSUM_ENTRY ? archive + ".sbom" : archive;
+        String checksumsPath = RELEASES_PATH + "v" + version + "/harness_" + version + "_checksums.txt";
         responses.put(RELEASES_PATH + "v" + version + "/" + archive, bundle);
-        responses.put(RELEASES_PATH + "v" + version + "/harness_" + version + "_checksums.txt",
-                (sha + "  " + archive + "\n").getBytes(StandardCharsets.UTF_8));
+        if (broken == Broken.CHECKSUMS_SERVER_ERROR) {
+            failing.add(checksumsPath);
+        } else {
+            responses.put(checksumsPath, (sha + "  " + listedName + "\n").getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     /** A bundle whose {@code harness} registers {@code harness-har} like {@code harness install plugin} does. */
-    private byte[] bundle(String version) throws Exception {
+    private byte[] bundle(String version, Broken broken) throws Exception {
         Path dir = Files.createDirectories(tmp.resolve("bundle-" + version));
         String padding = "#" + "x".repeat(1_100_000) + "\n";
         Files.writeString(dir.resolve("harness"), "#!/bin/sh\n"
                 + "set -e\n"
                 + "PATH=\"/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}\"\n"
                 + "if [ \"$1\" = install ] && [ \"$2\" = plugin ]; then\n"
+                + (broken == Broken.INSTALL_FAILS ? "  echo 'plugin rejected' >&2; exit 1\n" : "")
                 + "  : \"${HARNESS_CLI_HOME:?HARNESS_CLI_HOME is not set}\"\n"
                 + "  echo \"fake install: home=$HARNESS_CLI_HOME plugin=$3\"\n"
                 + "  mkdir -p \"$HARNESS_CLI_HOME/bin\" \"$HARNESS_CLI_HOME/spec\"\n"
@@ -206,13 +251,18 @@ class HarnessCliInstallerFlowTest {
                 + "fi\n"
                 + "echo harness " + version + "\n"
                 + "exit 0\n" + padding);
-        Files.writeString(dir.resolve("harness-har"), "#!/bin/sh\nexit 0\n" + padding);
-        for (String name : new String[] {"harness", "harness-har"}) {
+        List<String> entries = new java.util.ArrayList<>(List.of("harness"));
+        if (broken != Broken.NO_PLUGIN) {
+            Files.writeString(dir.resolve("harness-har"), "#!/bin/sh\nexit 0\n" + padding);
+            entries.add("harness-har");
+        }
+        for (String name : entries) {
             Files.setPosixFilePermissions(dir.resolve(name), PosixFilePermissions.fromString("rwxr-xr-x"));
         }
         Path archive = tmp.resolve("bundle-" + version + ".tar.gz");
-        Process tar = new ProcessBuilder("tar", "czf", archive.toString(), "-C", dir.toString(),
-                "harness", "harness-har").inheritIO().start();
+        List<String> cmd = new java.util.ArrayList<>(List.of("tar", "czf", archive.toString(), "-C", dir.toString()));
+        cmd.addAll(entries);
+        Process tar = new ProcessBuilder(cmd).inheritIO().start();
         assertEquals(0, tar.waitFor());
         return Files.readAllBytes(archive);
     }

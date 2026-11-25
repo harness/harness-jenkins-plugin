@@ -43,6 +43,7 @@ class HarnessCliJobsTest {
         Files.writeString(cli, "#!/bin/sh\n"
                 + "echo \"ARGS:$*\"\n"
                 + "echo \"KEY:${HARNESS_API_KEY:+set}\"\n"
+                + "echo \"HOME:${HARNESS_CLI_HOME:-}\"\n"
                 + "[ \"$1\" = fail ] && exit 3\n"
                 + "exit 0\n");
         Files.setPosixFilePermissions(cli, PosixFilePermissions.fromString("rwxr-xr-x"));
@@ -120,6 +121,40 @@ class HarnessCliJobsTest {
         project.getBuildersList().add(new Shell("true"));
 
         j.assertLogContains("Installation 'does-not-exist' not found", j.buildAndAssertSuccess(project));
+    }
+
+    @Test
+    void installerManagedToolGetsAPrivateCliHomePerWorkspace() throws Exception {
+        Files.createDirectories(toolDir.resolve("cli-home/bin"));
+        Files.createDirectories(toolDir.resolve("cli-home/spec"));
+        Files.writeString(toolDir.resolve("cli-home/bin/harness-har"), "plugin");
+        Files.writeString(toolDir.resolve("cli-home/spec/har.spec.yaml"), "binary_path: x");
+
+        FreeStyleProject project = j.createFreeStyleProject();
+        project.getBuildWrappersList().add(wrapper("fake"));
+        HarnessCliBuilder step = new HarnessCliBuilder("version");
+        step.setHarnessCliInstallation("fake");
+        project.getBuildersList().add(step);
+        project.getBuildersList().add(new Shell("echo \"WRAPPER_HOME=$HARNESS_CLI_HOME\""));
+
+        FreeStyleBuild build = j.buildAndAssertSuccess(project);
+        String home = build.getWorkspace().getRemote() + "@tmp/harness-cli-home";
+        j.assertLogContains("HOME:" + home, build);
+        j.assertLogContains("WRAPPER_HOME=" + home, build);
+    }
+
+    @Test
+    void buildStepWarnsWhenNoTokenIsConfiguredAnywhere() throws Exception {
+        HarnessGlobalConfiguration.get().setApiToken(Secret.fromString(""));
+        FreeStyleProject project = j.createFreeStyleProject();
+        HarnessCliBuilder step = new HarnessCliBuilder("version");
+        step.setHarnessCliInstallation("fake");
+        project.getBuildersList().add(step);
+
+        FreeStyleBuild build = j.buildAndAssertSuccess(project);
+        j.assertLogContains("Harness API Token is not configured", build);
+        j.assertLogContains("KEY:", build);
+        j.assertLogNotContains("KEY:set", build);
     }
 
     @Test

@@ -195,6 +195,7 @@ class HarnessCliInstallerFlowTest {
         String padding = "#" + "x".repeat(1_100_000) + "\n";
         Files.writeString(dir.resolve("harness"), "#!/bin/sh\n"
                 + "set -e\n"
+                + "PATH=\"/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}\"\n"
                 + "if [ \"$1\" = install ] && [ \"$2\" = plugin ]; then\n"
                 + "  : \"${HARNESS_CLI_HOME:?HARNESS_CLI_HOME is not set}\"\n"
                 + "  echo \"fake install: home=$HARNESS_CLI_HOME plugin=$3\"\n"

@@ -91,7 +91,7 @@ public class HarnessCliGitHubInstaller extends ToolInstaller {
     private static final int HTTP_MAX_ATTEMPTS = 8;
     private static final long HTTP_RETRY_INITIAL_DELAY_MS = 1_000L;
     private static final long HTTP_RETRY_MAX_DELAY_MS = 16_000L;
-    private static HttpClient httpClient = ProxyConfiguration.newHttpClientBuilder()
+    static HttpClient httpClient = ProxyConfiguration.newHttpClientBuilder()
             .followRedirects(HttpClient.Redirect.ALWAYS)
             .build();
 

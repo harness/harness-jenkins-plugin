@@ -11,7 +11,7 @@ public final class Constants {
 
     //harness cli urls
     public static final String GITHUB_RELEASES_BASE = "https://github.com/harness/cli/releases";
-    public static final String GITHUB_API_RELEASES = "https://api.github.com/repos/harness/cli/releases?per_page=50";
+    public static final String GITHUB_API_RELEASES = "https://api.github.com/repos/harness/cli/releases?per_page=100";
 
     private Constants() {
     }

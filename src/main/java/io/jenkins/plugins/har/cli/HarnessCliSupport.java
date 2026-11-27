@@ -12,6 +12,7 @@ import hudson.util.ArgumentListBuilder;
 import hudson.util.Secret;
 import io.jenkins.plugins.har.Constants;
 import jenkins.MasterToSlaveFileCallable;
+import org.apache.commons.io.output.TeeOutputStream;
 import org.apache.commons.lang3.StringUtils;
 
 import java.io.ByteArrayOutputStream;
@@ -90,20 +91,20 @@ public final class HarnessCliSupport {
             cmd = cmd.toWindowsCommand();
         }
 
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        MaskingOutputStream stdoutLog = new MaskingOutputStream(listener.getLogger(), secrets);
         MaskingOutputStream stderr = new MaskingOutputStream(listener.getLogger(), secrets);
         int exitCode = launcher.launch()
                 .envs(commandEnv)
                 .pwd(workspace)
                 .cmds(cmd)
-                .stdout(stdout)
+                .stdout(new TeeOutputStream(stdoutLog, captured))
                 .stderr(stderr)
                 .join();
+        stdoutLog.forceEol();
         stderr.forceEol();
 
-        String output = stdout.toString(StandardCharsets.UTF_8);
-        listener.getLogger().print(mask(output, secrets));
-        return new Result(exitCode, output);
+        return new Result(exitCode, captured.toString(StandardCharsets.UTF_8));
     }
 
     /**
@@ -230,8 +231,12 @@ public final class HarnessCliSupport {
         String apiUrl = StringUtils.defaultIfBlank(config.getApiUrl(), Constants.DEFAULT_BASE_URL);
         commandEnv.put(ENV_API_KEY, apiToken);
         commandEnv.put(ENV_API_URL, apiUrl);
-        putIfNotBlank(commandEnv, ENV_ORG, config.getOrgId());
-        putIfNotBlank(commandEnv, ENV_PROJECT, config.getProjectId());
+        if (StringUtils.isBlank(env.get(ENV_ORG))) {
+            putIfNotBlank(commandEnv, ENV_ORG, config.getOrgId());
+        }
+        if (StringUtils.isBlank(env.get(ENV_PROJECT))) {
+            putIfNotBlank(commandEnv, ENV_PROJECT, config.getProjectId());
+        }
         listener.getLogger().println("[harness] Using API token from Harness CLI Configuration for " + apiUrl);
         return commandEnv;
     }

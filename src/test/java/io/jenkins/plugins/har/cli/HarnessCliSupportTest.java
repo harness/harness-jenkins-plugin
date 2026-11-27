@@ -64,6 +64,12 @@ class HarnessCliSupportTest {
         assertEquals(GLOBAL_TOKEN, result.get("HARNESS_API_KEY"));
         assertEquals("https://example.invalid", result.get("HARNESS_API_URL"));
         assertEquals("my-org", result.get("HARNESS_ORG"));
+
+        EnvVars jobScope = commandEnvironment(new EnvVars("HARNESS_ORG", "job-org", "HARNESS_PROJECT", "job-project"),
+                "push", "artifact:generic");
+        assertEquals(GLOBAL_TOKEN, jobScope.get("HARNESS_API_KEY"));
+        assertEquals("job-org", jobScope.get("HARNESS_ORG"));
+        assertEquals("job-project", jobScope.get("HARNESS_PROJECT"));
     }
 
     @Test

@@ -71,7 +71,8 @@ Every Harness CLI command run by the plugin receives these values as environment
 A job can use its own credentials instead of the global ones. For each command, the first match wins:
 
 1. `--profile <name>` in the command, or `HARNESS_PROFILE` set in the build environment: a profile saved earlier with `harness auth login`.
-2. `HARNESS_API_KEY` set in the build environment. Set `HARNESS_API_URL`, `HARNESS_ORG` and `HARNESS_PROJECT` as needed too; the global values are not mixed in.3. The global **Harness CLI Configuration**.
+2. `HARNESS_API_KEY` set in the build environment. Set `HARNESS_API_URL`, `HARNESS_ORG` and `HARNESS_PROJECT` as needed too; the global values are not mixed in.
+3. The global **Harness CLI Configuration**. `HARNESS_ORG` and `HARNESS_PROJECT` set in the build environment take precedence over the configured ones.
 
 The recommended way is a Jenkins **Secret text** credential bound with `withCredentials`, which Jenkins also masks in the log:
 
@@ -190,7 +191,7 @@ Version 2.0 moves the plugin from the retired `hc` CLI ([harness/harness-cli](ht
 
 - **Command syntax:** rename `hc` steps to `harness` and update their arguments, and update the arguments of Freestyle build steps. For example, `artifact push generic my-registry app.jar --name app --version 1.0.0` becomes `push artifact:generic my-registry/app app.jar --version 1.0.0`. The `tools { harnessCli '…' }` directive does not change.
 - **Pinned versions:** a pinned tool version must be a [harness/cli release](https://github.com/harness/cli/releases), for example `3.13.0`. The installer only downloads releases from that page, so any other version, such as `1.3.47`, is rejected. Leave the field empty to install the latest release. Agents reinstall automatically on the next build.
-- **Authentication:** the plugin no longer runs `hc auth login` or `hc auth logout`. Credentials from **Manage Jenkins** → **System** are passed to each command as environment variables, unless the job supplies its own (see [Per-job credentials](#per-job-credentials)). Shell steps that call the CLI directly (for example `"$HARNESS_CLI_PATH/harness"`) do not receive the global credentials.
+- **Authentication:** the plugin no longer runs `hc auth login` or `hc auth logout`. Credentials from **Manage Jenkins** → **System** are passed to each command as environment variables, unless the job supplies its own (see [Per-job credentials](#per-job-credentials)). Shell steps that call the CLI directly (for example `"$HARNESS_CLI_PATH/harness"`) do not receive the global credentials, and in Pipeline jobs they cannot run Artifact Registry commands such as `push artifact:...`. Use the `harness` step for those.
 
 ---
 

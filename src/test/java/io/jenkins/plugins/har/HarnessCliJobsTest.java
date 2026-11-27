@@ -44,6 +44,7 @@ class HarnessCliJobsTest {
                 + "echo \"ARGS:$*\"\n"
                 + "echo \"KEY:${HARNESS_API_KEY:+set}\"\n"
                 + "echo \"HOME:${HARNESS_CLI_HOME:-}\"\n"
+                + "echo \"RAW:${HARNESS_API_KEY:-}\"\n"
                 + "[ \"$1\" = fail ] && exit 3\n"
                 + "exit 0\n");
         Files.setPosixFilePermissions(cli, PosixFilePermissions.fromString("rwxr-xr-x"));
@@ -73,6 +74,7 @@ class HarnessCliJobsTest {
         j.assertLogContains("ARGS:hello world", build);
         j.assertLogContains("KEY:set", build);
         j.assertLogNotContains("pat.GLOBAL.global.secret", build);
+        j.assertLogContains("RAW:****", build);
     }
 
     @Test
